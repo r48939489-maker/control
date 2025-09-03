@@ -1,8 +1,9 @@
-// server.js (updated, drop-in replacement)
+// server.js — continuous 24/7 FCM revive server
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const bodyParser = require('body-parser');
 const admin = require('firebase-admin');
 
 const PORT = parseInt(process.env.PORT || '5000', 10);
@@ -11,42 +12,19 @@ const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || '';
 const FIREBASE_CONFIG_ENV = process.env.FIREBASE_CONFIG || '';
 const FIREBASE_CONFIG_BASE64 = process.env.FIREBASE_CONFIG_BASE64 || '';
 
-const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10);
+const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10); // default 3s
+// optional: treat device as offline only if last seen older than this (default 30s)
 const LAST_SEEN_THRESHOLD_MS = parseInt(process.env.LAST_SEEN_THRESHOLD_MS || '30000', 10);
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 function warn(...a) { console.warn(new Date().toISOString(), ...a); }
 function errlog(...a) { console.error(new Date().toISOString(), ...a); }
 
-function maskToken(t) {
-  if (!t || typeof t !== 'string') return '<null>';
-  if (t.length <= 10) return t;
-  return `${t.slice(0,4)}...${t.slice(-6)}`;
-}
+function maskToken(t) { if (!t || typeof t !== 'string') return '<null>'; if (t.length <= 10) return t; return `${t.slice(0,4)}...${t.slice(-6)}`; }
 function tryParseJson(str) { if (!str || typeof str !== 'string') return null; try { return JSON.parse(str); } catch { return null; } }
 function stripQuotes(s){ if (!s || typeof s !== 'string') return s; s=s.trim(); if((s.startsWith('"')&&s.endsWith('"'))||(s.startsWith("'")&&s.endsWith("'")))s=s.slice(1,-1); return s; }
-function normalizePrivateKey(raw){
-  if (!raw || typeof raw !== 'string') return null;
-  let s = stripQuotes(raw);
-  // handle literally escaped newlines
-  s = s.replace(/\\\\n/g,'\\n');
-  s = s.replace(/\\n/g,'\n');
-  s = s.replace(/\r\n/g,'\n');
-  s = s.trim() + '\n';
-  s = s.replace(/\s*-----BEGIN PRIVATE KEY-----\s*/,'-----BEGIN PRIVATE KEY-----\n');
-  s = s.replace(/\s*-----END PRIVATE KEY-----\s*/,'\n-----END PRIVATE KEY-----\n');
-  s = s.replace(/\n{2,}/g,'\n');
-  return s;
-}
-// more compatible PEM check (no /s flag)
-function looksLikePem(s){
-  if (!s || typeof s !== 'string') return false;
-  const re = /^-----BEGIN PRIVATE KEY-----\n([A-Za-z0-9+\/=\n]+)\n-----END PRIVATE KEY-----\n?$/;
-  // fallback: allow more flexible content (base64 with possible line breaks)
-  if (re.test(s)) return true;
-  // loose check: BEGIN/END present and length looks right
-  return s.includes('-----BEGIN PRIVATE KEY-----') && s.includes('-----END PRIVATE KEY-----');
-}
+function normalizePrivateKey(raw){ if (!raw || typeof raw !== 'string') return null; let s=stripQuotes(raw); s=s.replace(/\\\\n/g,'\\n'); s=s.replace(/\\n/g,'\n'); s=s.replace(/\r\n/g,'\n'); s=s.trim()+'\n'; s=s.replace(/\s*-----BEGIN PRIVATE KEY-----\s*/s,'-----BEGIN PRIVATE KEY-----\n'); s=s.replace(/\s*-----END PRIVATE KEY-----\s*/s,'\n-----END PRIVATE KEY-----\n'); s=s.replace(/\n{2,}/g,'\n'); return s; }
+function looksLikePem(s){ if (!s||typeof s!=='string') return false; const re=/^-----BEGIN PRIVATE KEY-----\n([A-Za-z0-9+\/=\n]+)\n-----END PRIVATE KEY-----\n?$/s; return re.test(s); }
 
 // --- load service account from env/file (robust) ---
 let SERVICE_ACCOUNT = null;
@@ -162,9 +140,7 @@ async function getFcmTokenForDevice(deviceId) {
 function buildFcmMessage(token, deviceId, attempt, type) {
   return {
     token,
-    android: { priority: 'high', // TTL as string (safer)
-               ttl: '4s' 
-    },
+    android: { priority: 'high', ttl: 4000 },
     data: { type, deviceId: String(deviceId), attempt: String(attempt), ts: String(Date.now()) }
   };
 }
@@ -197,9 +173,11 @@ async function startJobFor(deviceId, statusVal = {}) {
     return;
   }
 
+  // if statusVal.timestamp exists, ensure device was offline long enough (optional)
   const lastSeen = statusVal.timestamp || 0;
   if (lastSeen && (Date.now() - lastSeen) < LAST_SEEN_THRESHOLD_MS) {
     log('[job] device', deviceId, 'reported offline but lastSeen < threshold; still starting since you requested continuous behavior');
+    // (we still start — keep this message for visibility)
   }
 
   let token = statusVal.fcmToken || await getFcmTokenForDevice(deviceId);
@@ -213,12 +191,14 @@ async function startJobFor(deviceId, statusVal = {}) {
   jobs.set(deviceId, job);
 
   job.interval = setInterval(() => {
+    // avoid overlapping sends if previous send still in progress
     if (job.stopped) return clearInterval(job.interval);
     if (job.sending) return;
 
     (async () => {
       job.sending = true;
       try {
+        // refresh token each cycle (in case mobile updated token)
         const freshToken = await getFcmTokenForDevice(deviceId);
         if (!freshToken) {
           errlog('[job] token missing on refresh for', deviceId, '- stopping job');
@@ -230,6 +210,7 @@ async function startJobFor(deviceId, statusVal = {}) {
           job.token = freshToken;
         }
 
+        // check online state in DB
         let snap;
         try { snap = await statusRef.child(deviceId).once('value'); } catch (e) { warn('[job] status read failed for', deviceId, e && e.message); snap = null; }
         const val = (snap && snap.val()) || {};
@@ -245,6 +226,7 @@ async function startJobFor(deviceId, statusVal = {}) {
         if (!r.ok) {
           const code = r.err && (r.err.code || r.err.message || JSON.stringify(r.err));
           errlog('[job] sendFcm failed for', deviceId, 'code=', code);
+          // detect permanent invalid token -> remove and stop job
           const codeStr = String(code || '').toLowerCase();
           if (codeStr.includes('registration-token-not-registered') ||
               codeStr.includes('invalid-registration-token') ||
@@ -258,6 +240,7 @@ async function startJobFor(deviceId, statusVal = {}) {
         }
       } catch (e) {
         errlog('[job] unexpected error for', deviceId, e && (e.stack || e.message || e));
+        // don't kill process; we'll retry next interval
       } finally {
         job.sending = false;
       }
@@ -295,6 +278,7 @@ setInterval(async () => {
     for (const [deviceId, val] of Object.entries(all)) {
       if (!val) continue;
       if (val.online) {
+        // if job exists but device online, ensure stopped
         if (jobs.has(deviceId)) stopJobFor(deviceId);
         continue;
       }
@@ -316,9 +300,8 @@ setInterval(async () => {
 
 // ---- Express API ----
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-app.get('/', (req, res) => res.send('FCM revive server — healthy. Use /health or /jobs'));
 app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.get('/jobs', (req, res) => {
