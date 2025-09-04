@@ -1,4 +1,4 @@
-// watcher.js — monitor + restart + tail
+// watcher.js — monitor + restart + tail (patched)
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -12,6 +12,9 @@ const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '5000', 10);
 const LOG_STALL_THRESHOLD_MS = parseInt(process.env.LOG_STALL_THRESHOLD_MS || '60000', 10);
 const KILL_TIMEOUT_MS = parseInt(process.env.KILL_TIMEOUT_MS || '5000', 10);
 const TAIL_POLL_MS = parseInt(process.env.TAIL_POLL_MS || '1000', 10);
+
+// Number of initial checks to allow grace (prevents immediate restart during server startup)
+const INITIAL_GRACE_CHECKS = parseInt(process.env.INITIAL_GRACE_CHECKS || '3', 10);
 
 function isoNow(){ return new Date().toISOString(); }
 
@@ -57,6 +60,8 @@ async function spawnServer(){
   }
 }
 
+let graceChecks = 0;
+
 async function checkOnce(){
   const pid = readNumberFile(PID_FILE);
   const lastLogTs = readNumberFile(LAST_LOG_TS_FILE);
@@ -64,6 +69,13 @@ async function checkOnce(){
   const age = lastLogTs ? (now - lastLogTs) : Infinity;
 
   console.log(isoNow(), `pid=${pid || 'NONE'} lastLogAgeMs=${age === Infinity ? 'NEVER' : age} threshold=${LOG_STALL_THRESHOLD_MS}`);
+
+  // startup grace: if last_log_ts missing, allow a few checks before forcing restart
+  if (age === Infinity && graceChecks < INITIAL_GRACE_CHECKS) {
+    graceChecks++;
+    console.log(isoNow(), `no last_log_ts yet — giving startup grace (${graceChecks}/${INITIAL_GRACE_CHECKS})`);
+    return;
+  }
 
   if (age > LOG_STALL_THRESHOLD_MS) {
     console.error(isoNow(), `detected log-stall age ${age}ms > threshold ${LOG_STALL_THRESHOLD_MS}ms. restarting pid ${pid || 'UNKNOWN'}`);
@@ -84,6 +96,8 @@ async function checkOnce(){
 
     // spawn new server
     await spawnServer();
+    // reset grace after restart
+    graceChecks = 0;
   }
 }
 
